@@ -1,9 +1,15 @@
 import type { NextApiResponse } from 'next';
+import { createHash } from 'crypto';
 import { MongoChatItem } from '@fastgpt/service/core/chat/chatItemSchema';
+import { MongoChat } from '@fastgpt/service/core/chat/chatSchema';
 import { ApiRequestProps } from '@fastgpt/service/type/next';
 import { jsonRes } from '@fastgpt/service/common/response';
 import { MongoResourceClick } from '@fastgpt/service/core/chat/resourceFeedback/clickSchema';
 import { MongoResourceFeedback } from '@fastgpt/service/core/chat/resourceFeedback/feedbackSchema';
+import { MongoResourceExposure } from '@fastgpt/service/core/chat/resourceFeedback/exposureSchema';
+import { ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
+import { chatValue2RuntimePrompt } from '@fastgpt/global/core/chat/adapt';
+import { getNanoid } from '@fastgpt/global/common/string/tools';
 
 export type GetRecommendedResourcesParams = {
   dataId: string;
@@ -29,6 +35,17 @@ type RecommendedResource = ScoredResource & {
 
 type FeedbackType = 'helpful' | 'notHelpful';
 
+type ChatItemMeta = {
+  dataId: string;
+  chatId?: string;
+  appId?: unknown;
+  teamId?: unknown;
+  tmbId?: unknown;
+  userId?: unknown;
+  time?: Date;
+  responseData?: any[];
+};
+
 const BILIBILI_MODULE_NAME = 'B站视频链接提取';
 const SEARCH_MODULE_NAME = '博查搜索';
 
@@ -43,6 +60,11 @@ const normalizeUrl = (url: string) =>
   url.startsWith('http://') || url.startsWith('https://') ? url : `https://${url}`;
 
 const getResourceKey = (item: Resource) => `${item.title}:::${item.url}`;
+const toOptionalString = (value: unknown): string | undefined => {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value);
+  return text ? text : undefined;
+};
 
 function parseDataId(dataId: string | string[] | undefined) {
   if (!dataId) return undefined;
@@ -217,6 +239,95 @@ function mergeAndLimitResources(
     }));
 }
 
+function normalizeQueryText(text: string) {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 1000);
+}
+
+function getQueryHash(text: string) {
+  if (!text) return '';
+  return createHash('sha256').update(text).digest('hex');
+}
+
+async function recordResourceExposure({
+  queryDataId,
+  resources,
+  chatItem
+}: {
+  queryDataId: string;
+  resources: RecommendedResource[];
+  chatItem: ChatItemMeta;
+}) {
+  if (!chatItem.chatId || resources.length === 0) return;
+
+  const [chatDoc, latestHumanItem] = await Promise.all([
+    MongoChat.findOne(
+      { chatId: chatItem.chatId },
+      { _id: 0, outLinkUid: 1, shareId: 1, source: 1 }
+    ).lean(),
+    MongoChatItem.findOne(
+      {
+        chatId: chatItem.chatId,
+        obj: ChatRoleEnum.Human,
+        ...(chatItem.time ? { time: { $lte: chatItem.time } } : {})
+      },
+      { _id: 0, dataId: 1, value: 1 }
+    )
+      .sort({ time: -1 })
+      .lean()
+  ]);
+
+  const queryText = normalizeQueryText(chatValue2RuntimePrompt((latestHumanItem as any)?.value || []).text);
+  const queryHash = getQueryHash(queryText);
+  const exposureId = getNanoid(24);
+  const exposedAt = new Date();
+
+  const baseMeta = {
+    exposureId,
+    queryDataId,
+    queryInputDataId: (latestHumanItem as any)?.dataId,
+    queryText,
+    queryHash,
+    chatId: chatItem.chatId,
+    appId: toOptionalString(chatItem.appId),
+    teamId: toOptionalString(chatItem.teamId),
+    tmbId: toOptionalString(chatItem.tmbId),
+    userId: toOptionalString(chatItem.userId),
+    outLinkUid: chatDoc?.outLinkUid,
+    shareId: chatDoc?.shareId,
+    source: chatDoc?.source,
+    exposureScene: 'recommend_list',
+    exposedAt
+  };
+
+  await MongoResourceExposure.bulkWrite(
+    resources.map((item) => ({
+      updateOne: {
+        filter: {
+          queryDataId,
+          resourceUrl: item.url,
+          displayRank: item.displayRank
+        },
+        update: {
+          $setOnInsert: {
+            ...baseMeta,
+            resourceTitle: item.title,
+            resourceUrl: item.url,
+            sourceType: item.sourceType,
+            sourceRank: item.sourceRank,
+            displayRank: item.displayRank,
+            score: item.score,
+            clickNumSnapshot: item.clickNum,
+            recommendCountSnapshot: item.recommendCount,
+            notRecommendCountSnapshot: item.notRecommendCount
+          }
+        },
+        upsert: true
+      }
+    })),
+    { ordered: false }
+  );
+}
+
 async function handler(req: ApiRequestProps<GetRecommendedResourcesParams>, res: NextApiResponse) {
   if (req.method !== 'GET') {
     return jsonRes(res, {
@@ -235,7 +346,10 @@ async function handler(req: ApiRequestProps<GetRecommendedResourcesParams>, res:
       });
     }
 
-    const chatItem = await MongoChatItem.findOne({ dataId }, { _id: 0, responseData: 1 }).lean();
+    const chatItem = (await MongoChatItem.findOne(
+      { dataId },
+      { _id: 0, dataId: 1, chatId: 1, appId: 1, teamId: 1, tmbId: 1, userId: 1, time: 1, responseData: 1 }
+    ).lean()) as ChatItemMeta | null;
 
     if (!chatItem) {
       return jsonRes(res, {
@@ -259,8 +373,21 @@ async function handler(req: ApiRequestProps<GetRecommendedResourcesParams>, res:
       calculateRecommendationScore(searchData)
     ]);
 
+    const recommendedResources = mergeAndLimitResources(scoredBilibiliData, scoredSearchData);
+
+    try {
+      await recordResourceExposure({
+        queryDataId: dataId,
+        resources: recommendedResources,
+        chatItem
+      });
+    } catch (recordError) {
+      // Exposure logging should not break recommendation API.
+      console.error('记录资源曝光失败:', recordError);
+    }
+
     return jsonRes(res, {
-      data: mergeAndLimitResources(scoredBilibiliData, scoredSearchData)
+      data: recommendedResources
     });
   } catch (error) {
     console.error('处理资源查询请求时出错:', error);

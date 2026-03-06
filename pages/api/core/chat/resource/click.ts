@@ -70,24 +70,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       setData.lastClickAt = new Date();
     }
 
-    const updateData: Record<string, any> = {
-      $setOnInsert: {
-        ...filter,
-        clicknum: 0,
-        totalDwellMs: 0,
-        dwellReportCount: 0
-      },
-      ...(Object.keys(setData).length > 0 ? { $set: setData } : {})
-    };
+    const setOnInsertData: Record<string, any> = { ...filter };
+    const incData: Record<string, number> = {};
 
     if (eventType === 'click') {
-      updateData.$inc = { clicknum: 1 };
+      setOnInsertData.totalDwellMs = 0;
+      setOnInsertData.dwellReportCount = 0;
+      incData.clicknum = 1;
     } else {
-      updateData.$inc = {
-        totalDwellMs: dwellMs,
-        dwellReportCount: dwellMs > 0 ? 1 : 0
-      };
+      setOnInsertData.clicknum = 0;
+      incData.totalDwellMs = dwellMs;
+      incData.dwellReportCount = dwellMs > 0 ? 1 : 0;
     }
+
+    const updateData: Record<string, any> = {
+      $setOnInsert: setOnInsertData,
+      $inc: incData,
+      ...(Object.keys(setData).length > 0 ? { $set: setData } : {})
+    };
 
     await MongoResourceClick.findOneAndUpdate(filter, updateData, { upsert: true, new: true });
 
