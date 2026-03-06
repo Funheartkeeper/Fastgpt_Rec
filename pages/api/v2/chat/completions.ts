@@ -60,6 +60,9 @@ import { getWorkflowResponseWrite } from '@fastgpt/service/core/workflow/dispatc
 import { WORKFLOW_MAX_RUN_TIMES } from '@fastgpt/service/core/workflow/constants';
 import { getPluginInputsFromStoreNodes } from '@fastgpt/global/core/app/plugin/utils';
 import { type ExternalProviderType } from '@fastgpt/global/core/workflow/runtime/type';
+import { extractQueryIntent } from '@fastgpt/service/core/chat/intent/extractQueryIntent';
+import { recordQueryIntent } from '@fastgpt/service/core/chat/intent/recordQueryIntent';
+import { buildUserKey, normalizeQueryText } from '@fastgpt/service/core/chat/intent/utils';
 
 type FastGptWebChatProps = {
   chatId?: string; // undefined: get histories from messages, '': new chat, 'xxxxx': get histories from db
@@ -216,6 +219,24 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
       return latestHumanChat;
     })();
+    const queryInputDataId = String((userQuestion as any)?.dataId || '');
+    const normalizedQuery = normalizeQueryText(
+      chatValue2RuntimePrompt(removeEmptyUserInput(userQuestion.value)).text
+    );
+    const source = (() => {
+      if (shareId) return ChatSourceEnum.share;
+      if (authType === AuthUserTypeEnum.apikey) return ChatSourceEnum.api;
+      if (spaceTeamId) return ChatSourceEnum.team;
+      return ChatSourceEnum.online;
+    })();
+    const userKey = buildUserKey({
+      tmbId: String(tmbId || ''),
+      outLinkUid: outLinkUserId ? String(outLinkUserId) : undefined,
+      customUid
+    });
+    // LLM call position for intent extraction:
+    // right after we finalize the current user query and before workflow dispatch.
+    const queryIntentPromise = extractQueryIntent(normalizedQuery);
 
     // Get and concat history;
     const limit = getMaxHistoryLimitFromNodes(app.modules);
@@ -311,18 +332,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // save chat
     const isOwnerUse = !shareId && !spaceTeamId && String(tmbId) === String(app.tmbId);
-    const source = (() => {
-      if (shareId) {
-        return ChatSourceEnum.share;
-      }
-      if (authType === 'apikey') {
-        return ChatSourceEnum.api;
-      }
-      if (spaceTeamId) {
-        return ChatSourceEnum.team;
-      }
-      return ChatSourceEnum.online;
-    })();
 
     const isInteractiveRequest = !!getLastInteractiveValue(histories);
     const { text: userInteractiveVal } = chatValue2RuntimePrompt(userQuestion.value);
@@ -370,6 +379,34 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           ...metadata
         },
         durationSeconds
+      });
+    }
+
+    try {
+      const queryIntent = await queryIntentPromise;
+      await recordQueryIntent({
+        queryDataId: responseChatItemId,
+        queryInputDataId: queryInputDataId || undefined,
+        chatId: saveChatId,
+        appId: String(app._id),
+        teamId: String(teamId),
+        tmbId: String(tmbId),
+        outLinkUid: outLinkUserId ? String(outLinkUserId) : undefined,
+        shareId: shareId || undefined,
+        source,
+        userKey,
+        queryText: normalizedQuery,
+        normalizedQuery,
+        result: queryIntent
+      });
+    } catch (intentError) {
+      addLog.warn('record query intent failed', {
+        route: '/api/v2/chat/completions',
+        chatId: saveChatId,
+        responseChatItemId,
+        queryInputDataId,
+        normalizedQuery,
+        intentError
       });
     }
 

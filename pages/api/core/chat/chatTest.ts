@@ -49,6 +49,9 @@ import {
   ChatSourceEnum
 } from '@fastgpt/global/core/chat/constants';
 import { saveChat, updateInteractiveChat } from '@fastgpt/service/core/chat/saveChat';
+import { extractQueryIntent } from '@fastgpt/service/core/chat/intent/extractQueryIntent';
+import { recordQueryIntent } from '@fastgpt/service/core/chat/intent/recordQueryIntent';
+import { buildUserKey, normalizeQueryText } from '@fastgpt/service/core/chat/intent/utils';
 
 export type Props = {
   messages: ChatCompletionMessageParam[];
@@ -121,6 +124,16 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
       return latestHumanChat;
     })();
+    const queryInputDataId = String((userQuestion as any)?.dataId || '');
+    const normalizedQuery = normalizeQueryText(
+      chatValue2RuntimePrompt(removeEmptyUserInput(userQuestion.value)).text
+    );
+    const userKey = buildUserKey({
+      tmbId: String(tmbId || '')
+    });
+    // LLM call position for intent extraction:
+    // right after userQuestion is finalized and before workflow dispatch.
+    const queryIntentPromise = extractQueryIntent(normalizedQuery);
 
     const limit = getMaxHistoryLimitFromNodes(nodes);
     const [{ histories }, chatDetail, { timezone, externalProvider }] = await Promise.all([
@@ -255,6 +268,32 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         source: ChatSourceEnum.test,
         content: [userQuestion, aiResponse],
         durationSeconds
+      });
+    }
+
+    try {
+      const queryIntent = await queryIntentPromise;
+      await recordQueryIntent({
+        queryDataId: responseChatItemId,
+        queryInputDataId: queryInputDataId || undefined,
+        chatId,
+        appId: String(app._id),
+        teamId: String(teamId),
+        tmbId: String(tmbId),
+        source: ChatSourceEnum.test,
+        userKey,
+        queryText: normalizedQuery,
+        normalizedQuery,
+        result: queryIntent
+      });
+    } catch (intentError) {
+      console.warn('record query intent failed in chatTest', {
+        route: '/api/core/chat/chatTest',
+        chatId,
+        responseChatItemId,
+        queryInputDataId,
+        normalizedQuery,
+        intentError
       });
     }
 

@@ -10,6 +10,7 @@ import { MongoResourceExposure } from '@fastgpt/service/core/chat/resourceFeedba
 import { ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
 import { chatValue2RuntimePrompt } from '@fastgpt/global/core/chat/adapt';
 import { getNanoid } from '@fastgpt/global/common/string/tools';
+import { buildUserKey } from '@fastgpt/service/core/chat/intent/utils';
 
 export type GetRecommendedResourcesParams = {
   dataId: string;
@@ -292,6 +293,11 @@ async function recordResourceExposure({
     teamId: toOptionalString(chatItem.teamId),
     tmbId: toOptionalString(chatItem.tmbId),
     userId: toOptionalString(chatItem.userId),
+    userKey: buildUserKey({
+      tmbId: toOptionalString(chatItem.tmbId),
+      outLinkUid: chatDoc?.outLinkUid,
+      userId: toOptionalString(chatItem.userId)
+    }),
     outLinkUid: chatDoc?.outLinkUid,
     shareId: chatDoc?.shareId,
     source: chatDoc?.source,
