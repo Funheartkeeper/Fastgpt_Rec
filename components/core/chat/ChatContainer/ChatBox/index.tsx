@@ -127,8 +127,21 @@ const ChatBox = ({
   }>();
   const [adminMarkData, setAdminMarkData] = useState<AdminMarkType & { dataId: string }>();
   const [questionGuides, setQuestionGuide] = useState<string[]>([]);
-  const [recommendedResources, setRecommendedResources] = useState<{ title: string; url: string }[]>([]);
-  const [chatItemResources, setChatItemResources] = useState<Record<string, { title: string; url: string }[]>>({});
+  const [recommendedResources, setRecommendedResources] = useState<
+    { title: string; url: string; sourceType?: 'bilibili' | 'search'; sourceRank?: number; displayRank?: number }[]
+  >([]);
+  const [chatItemResources, setChatItemResources] = useState<
+    Record<
+      string,
+      {
+        title: string;
+        url: string;
+        sourceType?: 'bilibili' | 'search';
+        sourceRank?: number;
+        displayRank?: number;
+      }[]
+    >
+  >({});
   const chatItemResourcesRef = useRef<Record<string, { title: string; url: string }[]>>({});
 
   const appAvatar = useContextSelector(ChatItemContext, (v) => v.chatBoxData?.app?.avatar);
@@ -422,12 +435,17 @@ const ChatBox = ({
           ...prev,
           [dataId]: result
         }));
+        setTimeout(() => {
+          scrollToBottom();
+        }, 100);
       }
       // console.log("getRecommendedResource result：", result);
+      return result;
     } catch (error) {
       console.log('Failed to get recommended resources:', error);
+      return [];
     }
-  }, []);
+  }, [scrollToBottom]);
 
   // 清空资源推荐（可选功能）
   const clearRecommendedResources = useCallback(() => {
@@ -608,17 +626,15 @@ const ChatBox = ({
               return newChatHistories;
             });
 
-            setTimeout(() => {
-              // Generate question guide only when not in interactive mode
-              if (!checkIsInteractiveByHistories(newChatHistories)) {
-                createQuestionGuide();
-              }
-              // Always fetch resource recommendations after AI reply finishes
-              getRecommendedResource(newChatHistories[newChatHistories.length - 1].dataId);
+            // Generate question guide only when not in interactive mode
+            if (!checkIsInteractiveByHistories(newChatHistories)) {
+              createQuestionGuide();
+            }
+            // Fetch recommended resources after the current AI reply is finished.
+            await getRecommendedResource(responseChatId);
 
-              generatingScroll(true);
-              isPc && TextareaDom.current?.focus();
-            }, 100);
+            generatingScroll(true);
+            isPc && TextareaDom.current?.focus();
 
             // tts audio
             autoTTSResponse && splitText2Audio(responseText, true);
@@ -1115,6 +1131,7 @@ const ChatBox = ({
     ScrollData,
     appAvatar,
     chatForm,
+    chatItemResources,
     chatRecords,
     chatStarted,
     chatType,

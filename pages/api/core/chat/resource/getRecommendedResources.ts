@@ -4,63 +4,33 @@ import { MongoChatItem } from '@fastgpt/service/core/chat/chatItemSchema';
 import { MongoChat } from '@fastgpt/service/core/chat/chatSchema';
 import { ApiRequestProps } from '@fastgpt/service/type/next';
 import { jsonRes } from '@fastgpt/service/common/response';
-import { MongoResourceClick } from '@fastgpt/service/core/chat/resourceFeedback/clickSchema';
-import { MongoResourceFeedback } from '@fastgpt/service/core/chat/resourceFeedback/feedbackSchema';
-import { MongoResourceExposure } from '@fastgpt/service/core/chat/resourceFeedback/exposureSchema';
 import { ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
 import { chatValue2RuntimePrompt } from '@fastgpt/global/core/chat/adapt';
 import { getNanoid } from '@fastgpt/global/common/string/tools';
-import { buildUserKey } from '@fastgpt/service/core/chat/intent/utils';
+import { buildUserKey, normalizeQueryText } from '@fastgpt/service/core/chat/intent/utils';
+import { getResourceRecallContext } from '@fastgpt/service/core/chat/resource/context';
+import { searchResourceCandidates } from '@fastgpt/service/core/chat/resource/provider';
+import {
+  mergeAndLimitResources,
+  scoreResourceCandidates
+} from '@fastgpt/service/core/chat/resource/rank';
+import type {
+  RecommendedResourceItem,
+  ResourceChatItemMeta,
+  ResourceItem
+} from '@fastgpt/service/core/chat/resource/types';
+import { MongoResourceExposure } from '@fastgpt/service/core/chat/resourceFeedback/exposureSchema';
 
 export type GetRecommendedResourcesParams = {
   dataId: string;
 };
 
-type Resource = {
-  title: string;
-  url: string;
-  sourceType: 'bilibili' | 'search';
-  sourceRank: number;
-};
-
-type ScoredResource = Resource & {
-  clickNum: number;
-  recommendCount: number;
-  notRecommendCount: number;
-  score: number;
-};
-
-type RecommendedResource = ScoredResource & {
-  displayRank: number;
-};
-
-type FeedbackType = 'helpful' | 'notHelpful';
-
-type ChatItemMeta = {
-  dataId: string;
-  chatId?: string;
-  appId?: unknown;
-  teamId?: unknown;
-  tmbId?: unknown;
-  userId?: unknown;
-  time?: Date;
-  responseData?: any[];
-};
-
 const BILIBILI_MODULE_NAME = 'B站视频链接提取';
 const SEARCH_MODULE_NAME = '博查搜索';
-
-const CLICK_WEIGHT = 1;
-const RECOMMEND_WEIGHT = 2;
-const NOT_RECOMMEND_WEIGHT = 1;
-
-const LIMIT_PER_SOURCE = 3;
-const FINAL_LIMIT = 5;
 
 const normalizeUrl = (url: string) =>
   url.startsWith('http://') || url.startsWith('https://') ? url : `https://${url}`;
 
-const getResourceKey = (item: Resource) => `${item.title}:::${item.url}`;
 const toOptionalString = (value: unknown): string | undefined => {
   if (value === undefined || value === null) return undefined;
   const text = String(value);
@@ -92,8 +62,8 @@ function toTextResult(nodeResult: unknown): string {
   }
 }
 
-function extractMarkdownResources(text: string): Resource[] {
-  const resources: Resource[] = [];
+function extractMarkdownResources(text: string): ResourceItem[] {
+  const resources: ResourceItem[] = [];
   const regex = /\[(.*?)\]\((.*?)\)/g;
   let match: RegExpExecArray | null = null;
 
@@ -117,20 +87,21 @@ function extractMarkdownResources(text: string): Resource[] {
   return resources;
 }
 
-function extractSearchResources(node: any): Resource[] {
+function extractSearchResources(node: any): ResourceItem[] {
   try {
     const searchResults = Array.isArray(node?.toolRes?.result) ? node.toolRes.result : [];
 
     return searchResults
       .filter((item: any) => item && typeof item === 'object' && item.name && item.url)
-      .map((item: { name: string; url: string }, index: number) => ({
+      .map((item: { name: string; url: string; snippet?: string }, index: number) => ({
         title: item.name,
         url: normalizeUrl(item.url),
+        snippet: item.snippet,
         sourceType: 'search',
         sourceRank: index + 1
       }));
   } catch (error) {
-    console.error('提取博查搜索结果时出错:', error);
+    console.error('extract search resources failed', error);
     return [];
   }
 }
@@ -150,100 +121,6 @@ function extractResources(responseData: any[] | undefined) {
   return { bilibiliData, searchData };
 }
 
-async function calculateRecommendationScore(data: Resource[]): Promise<ScoredResource[]> {
-  if (data.length === 0) {
-    return [];
-  }
-
-  const matchConditions = data.map((item) => ({
-    resourceTitle: item.title,
-    resourceUrl: item.url
-  }));
-
-  const [clickRecords, feedbackRecords] = await Promise.all([
-    MongoResourceClick.aggregate([
-      { $match: { $or: matchConditions } },
-      {
-        $group: {
-          _id: { resourceTitle: '$resourceTitle', resourceUrl: '$resourceUrl' },
-          totalClick: { $sum: '$clicknum' }
-        }
-      }
-    ]),
-    MongoResourceFeedback.aggregate([
-      { $match: { $or: matchConditions } },
-      {
-        $group: {
-          _id: {
-            resourceTitle: '$resourceTitle',
-            resourceUrl: '$resourceUrl',
-            feedbackType: '$feedbackType'
-          },
-          count: { $sum: 1 }
-        }
-      }
-    ])
-  ]);
-
-  const clickMap = new Map<string, number>();
-  const helpfulMap = new Map<string, number>();
-  const notHelpfulMap = new Map<string, number>();
-
-  clickRecords.forEach((record) => {
-    const key = `${record._id.resourceTitle}:::${record._id.resourceUrl}`;
-    clickMap.set(key, record.totalClick || 0);
-  });
-
-  feedbackRecords.forEach((record) => {
-    const key = `${record._id.resourceTitle}:::${record._id.resourceUrl}`;
-    const feedbackType = record._id.feedbackType as FeedbackType;
-
-    if (feedbackType === 'helpful') {
-      helpfulMap.set(key, record.count || 0);
-    } else if (feedbackType === 'notHelpful') {
-      notHelpfulMap.set(key, record.count || 0);
-    }
-  });
-
-  return data
-    .map((item) => {
-      const key = getResourceKey(item);
-      const clickNum = clickMap.get(key) ?? 0;
-      const recommendCount = helpfulMap.get(key) ?? 0;
-      const notRecommendCount = notHelpfulMap.get(key) ?? 0;
-      const score =
-        clickNum * CLICK_WEIGHT +
-        recommendCount * RECOMMEND_WEIGHT -
-        notRecommendCount * NOT_RECOMMEND_WEIGHT;
-
-      return {
-        ...item,
-        clickNum,
-        recommendCount,
-        notRecommendCount,
-        score
-      };
-    })
-    .sort((a, b) => b.score - a.score);
-}
-
-function mergeAndLimitResources(
-  scoredBilibiliData: ScoredResource[],
-  scoredSearchData: ScoredResource[]
-): RecommendedResource[] {
-  return [...scoredBilibiliData.slice(0, LIMIT_PER_SOURCE), ...scoredSearchData.slice(0, LIMIT_PER_SOURCE)]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, FINAL_LIMIT)
-    .map((item, index) => ({
-      ...item,
-      displayRank: index + 1
-    }));
-}
-
-function normalizeQueryText(text: string) {
-  return text.replace(/\s+/g, ' ').trim().slice(0, 1000);
-}
-
 function getQueryHash(text: string) {
   if (!text) return '';
   return createHash('sha256').update(text).digest('hex');
@@ -255,8 +132,8 @@ async function recordResourceExposure({
   chatItem
 }: {
   queryDataId: string;
-  resources: RecommendedResource[];
-  chatItem: ChatItemMeta;
+  resources: RecommendedResourceItem[];
+  chatItem: ResourceChatItemMeta;
 }) {
   if (!chatItem.chatId || resources.length === 0) return;
 
@@ -277,7 +154,9 @@ async function recordResourceExposure({
       .lean()
   ]);
 
-  const queryText = normalizeQueryText(chatValue2RuntimePrompt((latestHumanItem as any)?.value || []).text);
+  const queryText = normalizeQueryText(
+    chatValue2RuntimePrompt((latestHumanItem as any)?.value || []).text
+  );
   const queryHash = getQueryHash(queryText);
   const exposureId = getNanoid(24);
   const exposedAt = new Date();
@@ -338,7 +217,7 @@ async function handler(req: ApiRequestProps<GetRecommendedResourcesParams>, res:
   if (req.method !== 'GET') {
     return jsonRes(res, {
       code: 405,
-      message: '方法不允许'
+      message: 'Method not allowed'
     });
   }
 
@@ -348,35 +227,43 @@ async function handler(req: ApiRequestProps<GetRecommendedResourcesParams>, res:
     if (!dataId) {
       return jsonRes(res, {
         code: 400,
-        message: '缺少必要参数'
+        message: 'Missing required parameter'
       });
     }
 
-    const chatItem = (await MongoChatItem.findOne(
-      { dataId },
-      { _id: 0, dataId: 1, chatId: 1, appId: 1, teamId: 1, tmbId: 1, userId: 1, time: 1, responseData: 1 }
-    ).lean()) as ChatItemMeta | null;
+    const recallContext = await getResourceRecallContext(dataId);
 
-    if (!chatItem) {
+    if (!recallContext?.chatItem) {
       return jsonRes(res, {
-        code: 404,
-        message: '未找到相关资源'
+        data: []
       });
     }
 
-    const responseData = (chatItem as any).responseData as any[] | undefined;
-    const { bilibiliData, searchData } = extractResources(responseData);
+    const chatItem = recallContext.chatItem;
+    let { bilibiliData, searchData } = await searchResourceCandidates(recallContext);
+
+    if (bilibiliData.length === 0 && searchData.length === 0) {
+      const responseData = (chatItem as any).responseData as any[] | undefined;
+      const extractedResources = extractResources(responseData);
+      bilibiliData = extractedResources.bilibiliData;
+      searchData = extractedResources.searchData;
+    }
 
     if (bilibiliData.length === 0 && searchData.length === 0) {
       return jsonRes(res, {
-        code: 404,
-        message: '未找到相关资源'
+        data: []
       });
     }
 
     const [scoredBilibiliData, scoredSearchData] = await Promise.all([
-      calculateRecommendationScore(bilibiliData),
-      calculateRecommendationScore(searchData)
+      scoreResourceCandidates({
+        data: bilibiliData,
+        context: recallContext
+      }),
+      scoreResourceCandidates({
+        data: searchData,
+        context: recallContext
+      })
     ]);
 
     const recommendedResources = mergeAndLimitResources(scoredBilibiliData, scoredSearchData);
@@ -388,18 +275,17 @@ async function handler(req: ApiRequestProps<GetRecommendedResourcesParams>, res:
         chatItem
       });
     } catch (recordError) {
-      // Exposure logging should not break recommendation API.
-      console.error('记录资源曝光失败:', recordError);
+      console.error('record resource exposure failed', recordError);
     }
 
     return jsonRes(res, {
       data: recommendedResources
     });
   } catch (error) {
-    console.error('处理资源查询请求时出错:', error);
+    console.error('get recommended resources failed', error);
     return jsonRes(res, {
       code: 500,
-      message: '处理请求时出错'
+      message: 'Failed to process request'
     });
   }
 }
