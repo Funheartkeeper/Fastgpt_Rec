@@ -31,6 +31,7 @@ import type { AdminMarkType } from './components/SelectMarkCollection';
 import MyTooltip from '@fastgpt/web/components/common/MyTooltip';
 
 import { postQuestionGuide } from '@/web/core/ai/api';
+import { getRecommendedResources } from '@/web/core/chat/api';
 import type { ChatBoxInputType, ChatBoxInputFormType, SendPromptFnType } from './type.d';
 import type { StartChatFnProps, generatingMessageProps } from '../type';
 import ChatInput from './Input/ChatInput';
@@ -81,14 +82,6 @@ enum FeedbackTypeEnum {
   hidden = 'hidden'
 }
 
-type RecommendedResourceStateItem = {
-  title: string;
-  url: string;
-  sourceType?: 'bilibili' | 'search';
-  sourceRank?: number;
-  displayRank?: number;
-};
-
 type Props = OutLinkChatAuthProps &
   ChatProviderProps & {
     isReady: boolean;
@@ -123,6 +116,7 @@ const ChatBox = ({
   const TextareaDom = useRef<HTMLTextAreaElement>(null);
   const chatController = useRef(new AbortController());
   const questionGuideController = useRef(new AbortController());
+  const recommendedResourcesController = useRef(new AbortController());
   const pluginController = useRef(new AbortController());
 
   const [isLoading, setIsLoading] = useState(false);
@@ -133,9 +127,23 @@ const ChatBox = ({
   }>();
   const [adminMarkData, setAdminMarkData] = useState<AdminMarkType & { dataId: string }>();
   const [questionGuides, setQuestionGuide] = useState<string[]>([]);
+  const [recommendedResources, setRecommendedResources] = useState<
+    { title: string; url: string; sourceType?: 'bilibili' | 'search'; sourceRank?: number; displayRank?: number }[]
+  >([]);
   const [chatItemResources, setChatItemResources] = useState<
-    Record<string, RecommendedResourceStateItem[]>
+    Record<
+      string,
+      {
+        title: string;
+        url: string;
+        sourceType?: 'bilibili' | 'search';
+        sourceRank?: number;
+        displayRank?: number;
+      }[]
+    >
   >({});
+  const chatItemResourcesRef = useRef<Record<string, { title: string; url: string }[]>>({});
+
   const appAvatar = useContextSelector(ChatItemContext, (v) => v.chatBoxData?.app?.avatar);
   const userAvatar = useContextSelector(ChatItemContext, (v) => v.chatBoxData?.userAvatar);
   const chatBoxData = useContextSelector(ChatItemContext, (v) => v.chatBoxData);
@@ -228,22 +236,11 @@ const ChatBox = ({
       name,
       tool,
       interactive,
-      chatItemDataId,
-      recommendedResources,
       autoTTSResponse,
       variables,
       nodeResponse,
       durationSeconds
     }: generatingMessageProps & { autoTTSResponse?: boolean }) => {
-      if (event === SseResponseEventEnum.recommendedResources && chatItemDataId) {
-        setChatItemResources((prev) => ({
-          ...prev,
-          [chatItemDataId]: recommendedResources || []
-        }));
-        generatingScroll(true);
-        return;
-      }
-
       setChatRecords((state) =>
         state.map((item, index) => {
           if (index !== state.length - 1) return item;
@@ -421,11 +418,45 @@ const ChatBox = ({
     } catch (error) {}
   }, [questionGuide, appId, chatId, outLinkAuthData, scrollToBottom]);
 
+  // 获取资源推荐
+  const getRecommendedResource = useCallback(async (dataId: string) => {
+    if (chatController.current?.signal?.aborted) return;
+    try {
+      const abortSignal = new AbortController();
+      recommendedResourcesController.current = abortSignal;
+      const result = await getRecommendedResources({ dataId });
+      if (Array.isArray(result)) {
+        // // 为特定的对话项设置资源推荐
+        // chatItemResourcesRef.current = {
+        //   ...chatItemResourcesRef.current,
+        //   [dataId]: result
+        // };
+        setChatItemResources(prev => ({
+          ...prev,
+          [dataId]: result
+        }));
+        setTimeout(() => {
+          scrollToBottom();
+        }, 100);
+      }
+      // console.log("getRecommendedResource result：", result);
+      return result;
+    } catch (error) {
+      console.log('Failed to get recommended resources:', error);
+      return [];
+    }
+  }, [scrollToBottom]);
+
   // 清空资源推荐（可选功能）
-  /* Abort chat completions, questionGuide */
+  const clearRecommendedResources = useCallback(() => {
+    setRecommendedResources([]);
+  }, []);
+
+  /* Abort chat completions, questionGuide, recommendedResources */
   const abortRequest = useMemoizedFn((signal: string = 'stop') => {
     chatController.current?.abort(signal);
     questionGuideController.current?.abort(signal);
+    recommendedResourcesController.current?.abort(signal);
     pluginController.current?.abort(signal);
   });
 
@@ -544,6 +575,7 @@ const ChatBox = ({
           resetInputVal({});
           setQuestionGuide([]);
           // 清空全局资源推荐状态，但保留每个对话项的资源推荐
+          setRecommendedResources([]);
           scrollToBottom('smooth', 100);
 
           try {
@@ -598,6 +630,9 @@ const ChatBox = ({
             if (!checkIsInteractiveByHistories(newChatHistories)) {
               createQuestionGuide();
             }
+            // Fetch recommended resources after the current AI reply is finished.
+            await getRecommendedResource(responseChatId);
+
             generatingScroll(true);
             isPc && TextareaDom.current?.focus();
 
@@ -873,6 +908,7 @@ const ChatBox = ({
   useEffect(() => {
     setQuestionGuide([]);
     // 清空全局资源推荐状态和每个对话项的资源推荐
+    setRecommendedResources([]);
     setChatItemResources({});
     setValue('chatStarted', false);
     abortRequest('leave');
@@ -1108,6 +1144,7 @@ const ChatBox = ({
     onMark,
     onReadUserDislike,
     questionGuides,
+    recommendedResources,
     retryInput,
     showEmpty,
     showMarkIcon,

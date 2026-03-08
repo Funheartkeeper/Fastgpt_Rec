@@ -63,12 +63,6 @@ import { type ExternalProviderType } from '@fastgpt/global/core/workflow/runtime
 import { extractQueryIntent } from '@fastgpt/service/core/chat/intent/extractQueryIntent';
 import { recordQueryIntent } from '@fastgpt/service/core/chat/intent/recordQueryIntent';
 import { buildUserKey, normalizeQueryText } from '@fastgpt/service/core/chat/intent/utils';
-import {
-  buildResourceRecallContext,
-  getRecommendedResourcesFromRecallContext,
-  recordRecommendedResourceExposure
-} from '@fastgpt/service/core/chat/resource/recommend';
-import type { ResourceChatItemMeta } from '@fastgpt/service/core/chat/resource/types';
 
 type FastGptWebChatProps = {
   chatId?: string; // undefined: get histories from messages, '': new chat, 'xxxxx': get histories from db
@@ -243,24 +237,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // LLM call position for intent extraction:
     // right after we finalize the current user query and before workflow dispatch.
     const queryIntentPromise = extractQueryIntent(normalizedQuery);
-    const recommendedResourcesPromise = (async () => {
-      const queryIntent = await queryIntentPromise.catch(() => undefined);
-
-      return getRecommendedResourcesFromRecallContext({
-        context: buildResourceRecallContext({
-          chatItem: {
-            dataId: responseChatItemId,
-            appId: String(app._id),
-            teamId,
-            tmbId
-          } as ResourceChatItemMeta,
-          queryText: normalizedQuery,
-          normalizedQuery,
-          queryInputDataId: queryInputDataId || undefined,
-          result: queryIntent
-        })
-      }).catch(() => []);
-    })();
 
     // Get and concat history;
     const limit = getMaxHistoryLimitFromNodes(app.modules);
@@ -440,34 +416,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const feResponseData = responseAllData
       ? flowResponses
       : filterPublicNodeResponseData({ flowResponses, responseDetail });
-    const recommendedResources = await recommendedResourcesPromise.catch(() => []);
 
     if (stream) {
-      if (recommendedResources.length > 0) {
-        try {
-          await recordRecommendedResourceExposure({
-            queryDataId: responseChatItemId,
-            queryInputDataId: queryInputDataId || undefined,
-            queryText: normalizedQuery,
-            chatId: saveChatId,
-            appId: String(app._id),
-            teamId: String(teamId),
-            tmbId: String(tmbId),
-            outLinkUid: outLinkUserId ? String(outLinkUserId) : undefined,
-            shareId: shareId || undefined,
-            source,
-            resources: recommendedResources
-          });
-        } catch (recordExposureError) {
-          addLog.warn('record recommended resource exposure failed', {
-            route: '/api/v2/chat/completions',
-            chatId: saveChatId,
-            responseChatItemId,
-            recordExposureError
-          });
-        }
-      }
-
       workflowResponseWrite({
         event: SseResponseEventEnum.answer,
         data: textAdaptGptResponse({
@@ -475,16 +425,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           finish_reason: 'stop'
         })
       });
-      if (recommendedResources.length > 0) {
-        responseWrite({
-          res,
-          event: SseResponseEventEnum.recommendedResources,
-          data: JSON.stringify({
-            chatItemDataId: responseChatItemId,
-            resources: recommendedResources
-          })
-        });
-      }
       responseWrite({
         res,
         event: detail ? SseResponseEventEnum.answer : undefined,
@@ -511,7 +451,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       const error = flowResponses[flowResponses.length - 1]?.error;
 
       res.json({
-        ...(detail ? { responseData: feResponseData, newVariables, recommendedResources } : {}),
+        ...(detail ? { responseData: feResponseData, newVariables } : {}),
         error,
         id: chatId || '',
         model: '',
