@@ -4,6 +4,7 @@ import type {
   ChatHistoryItemResType,
   ToolModuleResponseItemType
 } from '@fastgpt/global/core/chat/type';
+import { SseResponseEventEnum } from '@fastgpt/global/core/workflow/runtime/constants';
 import { ChatSiteItemType } from '@fastgpt/global/core/chat/type';
 import type { WorkflowInteractiveResponseType } from '@fastgpt/global/core/workflow/template/system/interactive/type';
 
@@ -18,6 +19,14 @@ export type generatingMessageProps = {
   variables?: Record<string, any>;
   nodeResponse?: ChatHistoryItemResType;
   durationSeconds?: number;
+  chatItemDataId?: string;
+  recommendedResources?: {
+    title: string;
+    url: string;
+    sourceType?: 'bilibili' | 'search';
+    sourceRank?: number;
+    displayRank?: number;
+  }[];
 };
 
 export type StartChatFnProps = {

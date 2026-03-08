@@ -1,0 +1,324 @@
+import type { AIChatItemType, UserChatItemType } from '@fastgpt/global/core/chat/type.d';
+import { MongoApp } from '../app/schema';
+import type { ChatSourceEnum } from '@fastgpt/global/core/chat/constants';
+import { ChatItemValueTypeEnum, ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
+import { MongoChatItem } from './chatItemSchema';
+import { MongoChat } from './chatSchema';
+import { addLog } from '../../common/system/log';
+import { mongoSessionRun } from '../../common/mongo/sessionRun';
+import { type StoreNodeItemType } from '@fastgpt/global/core/workflow/type/node';
+import { getAppChatConfig, getGuideModule } from '@fastgpt/global/core/workflow/utils';
+import { type AppChatConfigType } from '@fastgpt/global/core/app/type';
+import { mergeChatResponseData } from '@fastgpt/global/core/chat/utils';
+import { pushChatLog } from './pushChatLog';
+import { FlowNodeTypeEnum } from '@fastgpt/global/core/workflow/node/constant';
+import { DispatchNodeResponseKeyEnum } from '@fastgpt/global/core/workflow/runtime/constants';
+import { extractDeepestInteractive } from '@fastgpt/global/core/workflow/runtime/utils';
+import axios from 'axios';
+type Props = {
+  chatId: string;
+  appId: string;
+  teamId: string;
+  tmbId: string;
+  nodes: StoreNodeItemType[];
+  appChatConfig?: AppChatConfigType;
+  variables?: Record<string, any>;
+  isUpdateUseTime: boolean;
+  newTitle: string;
+  source: `${ChatSourceEnum}`;
+  sourceName?: string;
+  shareId?: string;
+  outLinkUid?: string;
+  content: [UserChatItemType & { dataId?: string }, AIChatItemType & { dataId?: string }];
+  metadata?: Record<string, any>;
+  durationSeconds: number; //s
+  errorMsg?: string;
+};
+
+export async function saveChat({
+  chatId,
+  appId,
+  teamId,
+  tmbId,
+  nodes,
+  appChatConfig,
+  variables,
+  isUpdateUseTime,
+  newTitle,
+  source,
+  sourceName,
+  shareId,
+  outLinkUid,
+  content,
+  durationSeconds,
+  errorMsg,
+  metadata = {}
+}: Props) {
+  if (!chatId || chatId === 'NO_RECORD_HISTORIES') return;
+
+  try {
+    const chat = await MongoChat.findOne(
+      {
+        appId,
+        chatId
+      },
+      '_id metadata'
+    );
+
+    const metadataUpdate = {
+      ...chat?.metadata,
+      ...metadata
+    };
+    const { welcomeText, variables: variableList } = getAppChatConfig({
+      chatConfig: appChatConfig,
+      systemConfigNode: getGuideModule(nodes),
+      isPublicFetch: false
+    });
+    const pluginInputs = nodes?.find(
+      (node) => node.flowNodeType === FlowNodeTypeEnum.pluginInput
+    )?.inputs;
+
+    // Format save chat content: Remove quote q/a
+    const processedContent = content.map((item) => {
+      if (item.obj === ChatRoleEnum.AI) {
+        const nodeResponse = item[DispatchNodeResponseKeyEnum.nodeResponse]?.map((responseItem) => {
+          if (
+            responseItem.moduleType === FlowNodeTypeEnum.datasetSearchNode &&
+            responseItem.quoteList
+          ) {
+            return {
+              ...responseItem,
+              quoteList: responseItem.quoteList.map((quote: any) => ({
+                id: quote.id,
+                chunkIndex: quote.chunkIndex,
+                datasetId: quote.datasetId,
+                collectionId: quote.collectionId,
+                sourceId: quote.sourceId,
+                sourceName: quote.sourceName,
+                score: quote.score,
+                tokens: quote.tokens
+              }))
+            };
+          }
+          return responseItem;
+        });
+
+        return {
+          ...item,
+          [DispatchNodeResponseKeyEnum.nodeResponse]: nodeResponse,
+          durationSeconds,
+          errorMsg
+        };
+      }
+      return item;
+    });
+
+    await mongoSessionRun(async (session) => {
+      const [{ _id: chatItemIdHuman }, { _id: chatItemIdAi }] = await MongoChatItem.insertMany(
+        processedContent.map((item) => ({
+          chatId,
+          teamId,
+          tmbId,
+          appId,
+          ...item
+        })),
+        { session }
+      );
+
+      await MongoChat.updateOne(
+        {
+          appId,
+          chatId
+        },
+        {
+          $set: {
+            teamId,
+            tmbId,
+            appId,
+            chatId,
+            variableList,
+            welcomeText,
+            variables: variables || {},
+            pluginInputs,
+            title: newTitle,
+            source,
+            sourceName,
+            shareId,
+            outLinkUid,
+            metadata: metadataUpdate,
+            updateTime: new Date()
+          }
+        },
+        {
+          session,
+          upsert: true
+        }
+      );
+
+      pushChatLog({
+        chatId,
+        chatItemIdHuman: String(chatItemIdHuman),
+        chatItemIdAi: String(chatItemIdAi),
+        appId
+      });
+    });
+
+    // 发送数据到指定URL形成知识图谱
+    const [userMessage, aiMessage] = content;
+    const aiText = Array.isArray(aiMessage.value)
+      ? aiMessage.value
+        .filter((v) => v.type === 'text' && typeof v.text?.content === 'string')
+        .map((v) => v.text!.content)
+        .join('\n')
+      : '';
+
+    const userText = Array.isArray(userMessage.value)
+      ? userMessage.value
+        .filter((v) => v.type === 'text' && typeof v.text?.content === 'string')
+        .map((v) => v.text!.content)
+        .join('\n')
+      : '';
+
+    const aiToKnowledgeGraph = {
+      course_id: shareId,
+      // student_id: outLinkUid,
+      query: userText,
+      answer: aiText,
+      display_mode: 'current_page'
+    };
+
+    const url = 'http://180.85.206.21:5000/update_kg';
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+
+    try {
+      console.log('正在传输');
+      await axios.post(url, aiToKnowledgeGraph, { headers });
+      addLog.debug('成功发送聊天数据到目标URL', aiToKnowledgeGraph);
+    } catch (sendError) {
+      if (sendError instanceof Error) {
+        if (sendError.message.includes('Network Error')) {
+          console.log(`错误: 无法连接到服务器 ${url}`);
+          console.log('请检查服务器是否运行以及网络连接是否正常');
+        } else if (sendError.message.includes('timeout')) {
+          console.log('错误: 请求超时');
+          console.log('服务器可能处于高负载状态，请稍后重试');
+        } else {
+          console.log(`发生其他错误: ${sendError.message}`);
+        }
+      }
+      addLog.error('发送聊天数据失败', sendError);
+    }
+    
+    if (isUpdateUseTime) {
+      await MongoApp.findByIdAndUpdate(appId, {
+        updateTime: new Date()
+      }).catch();
+    }
+  } catch (error) {
+    addLog.error(`update chat history error`, error);
+  }
+}
+
+export const updateInteractiveChat = async ({
+  chatId,
+  appId,
+  userInteractiveVal,
+  aiResponse,
+  newVariables,
+  durationSeconds
+}: {
+  chatId: string;
+  appId: string;
+  userInteractiveVal: string;
+  aiResponse: AIChatItemType & { dataId?: string };
+  newVariables?: Record<string, any>;
+  durationSeconds: number;
+}) => {
+  if (!chatId) return;
+
+  const chatItem = await MongoChatItem.findOne({ appId, chatId, obj: ChatRoleEnum.AI }).sort({
+    _id: -1
+  });
+
+  if (!chatItem || chatItem.obj !== ChatRoleEnum.AI) return;
+
+  // Update interactive value
+  const interactiveValue = chatItem.value[chatItem.value.length - 1];
+
+  if (
+    !interactiveValue ||
+    interactiveValue.type !== ChatItemValueTypeEnum.interactive ||
+    !interactiveValue.interactive?.params
+  ) {
+    return;
+  }
+
+  const parsedUserInteractiveVal = (() => {
+    try {
+      return JSON.parse(userInteractiveVal);
+    } catch (err) {
+      return userInteractiveVal;
+    }
+  })();
+
+  let finalInteractive = extractDeepestInteractive(interactiveValue.interactive);
+
+  if (finalInteractive.type === 'userSelect') {
+    finalInteractive.params.userSelectedVal = userInteractiveVal;
+  } else if (
+    finalInteractive.type === 'userInput' &&
+    typeof parsedUserInteractiveVal === 'object'
+  ) {
+    finalInteractive.params.inputForm = finalInteractive.params.inputForm.map((item) => {
+      const itemValue = parsedUserInteractiveVal[item.label];
+      return itemValue !== undefined
+        ? {
+            ...item,
+            value: itemValue
+          }
+        : item;
+    });
+    finalInteractive.params.submitted = true;
+  }
+
+  if (aiResponse.customFeedbacks) {
+    chatItem.customFeedbacks = chatItem.customFeedbacks
+      ? [...chatItem.customFeedbacks, ...aiResponse.customFeedbacks]
+      : aiResponse.customFeedbacks;
+  }
+
+  if (aiResponse.responseData) {
+    chatItem.responseData = chatItem.responseData
+      ? mergeChatResponseData([...chatItem.responseData, ...aiResponse.responseData])
+      : aiResponse.responseData;
+  }
+
+  if (aiResponse.value) {
+    chatItem.value = chatItem.value ? [...chatItem.value, ...aiResponse.value] : aiResponse.value;
+  }
+
+  chatItem.durationSeconds = chatItem.durationSeconds
+    ? +(chatItem.durationSeconds + durationSeconds).toFixed(2)
+    : durationSeconds;
+
+  await mongoSessionRun(async (session) => {
+    await chatItem.save({ session });
+    await MongoChat.updateOne(
+      {
+        appId,
+        chatId
+      },
+      {
+        $set: {
+          variables: newVariables,
+          updateTime: new Date()
+        }
+      },
+      {
+        session
+      }
+    );
+  });
+};

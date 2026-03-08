@@ -26,6 +26,17 @@ type ResponseQueueItemType =
       text?: string;
       reasoningText?: string;
     }
+  | {
+      event: SseResponseEventEnum.recommendedResources;
+      chatItemDataId?: string;
+      recommendedResources?: {
+        title: string;
+        url: string;
+        sourceType?: 'bilibili' | 'search';
+        sourceRank?: number;
+        displayRank?: number;
+      }[];
+    }
   | { event: SseResponseEventEnum.interactive; [key: string]: any }
   | {
       event:
@@ -225,6 +236,12 @@ export const streamFetch = ({
             onMessage({
               event,
               variables: parseJson
+            });
+          } else if (event === SseResponseEventEnum.recommendedResources) {
+            pushDataToQueue({
+              event,
+              chatItemDataId: parseJson.chatItemDataId,
+              recommendedResources: Array.isArray(parseJson.resources) ? parseJson.resources : []
             });
           } else if (event === SseResponseEventEnum.interactive) {
             pushDataToQueue({
