@@ -1,5 +1,20 @@
 import { GET, POST, DELETE, PUT } from '@/web/common/api/request';
-import type { ChatHistoryItemType, ChatHistoryItemResType } from '@fastgpt/global/core/chat/type.d';
+import type {
+  ChatHistoryItemType,
+  ChatHistoryItemResType,
+  ShareDeleteResourceParams,
+  ShareDeleteResourceResponse,
+  ShareListResourcesParams,
+  ShareListResourcesResponse,
+  SharePublicListResourcesParams,
+  SharePublicListResourcesResponse,
+  ShareReadResourceParams,
+  ShareReadResourceResponse,
+  ShareUpdateResourceParams,
+  ShareUpdateResourceResponse,
+  ShareUploadResourceParams,
+  ShareUploadResourceResponse
+} from '@fastgpt/global/core/chat/type.d';
 import type { getResDataQuery } from '@/pages/api/core/chat/getResData';
 import type {
   CloseCustomFeedbackParams,
@@ -146,6 +161,24 @@ export const submitResourceFeedback = async (data: {
 
 
 //资源推荐
+export const shareUploadResource = (data: ShareUploadResourceParams) =>
+  POST<ShareUploadResourceResponse>('/core/chat/resource/manage/shareUpload', data);
+
+export const shareListResources = (data: ShareListResourcesParams) =>
+  GET<ShareListResourcesResponse>('/core/chat/resource/manage/shareList', data);
+
+export const sharePublicListResources = (data: SharePublicListResourcesParams) =>
+  GET<SharePublicListResourcesResponse>('/core/chat/resource/manage/sharePublicList', data);
+
+export const shareDeleteResource = (data: ShareDeleteResourceParams) =>
+  DELETE<ShareDeleteResourceResponse>('/core/chat/resource/manage/shareDelete', data);
+
+export const shareUpdateResource = (data: ShareUpdateResourceParams) =>
+  POST<ShareUpdateResourceResponse>('/core/chat/resource/manage/shareUpdate', data);
+
+export const shareReadResource = (data: ShareReadResourceParams) =>
+  GET<ShareReadResourceResponse>('/core/chat/resource/manage/shareRead', data);
+
 export const getRecommendedResources = (data: GetRecommendedResourcesParams) =>
   GET<
     Array<{

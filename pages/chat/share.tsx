@@ -51,6 +51,7 @@ import { type AppSchema } from '@fastgpt/global/core/app/type';
 import ChatQuoteList from '@/pageComponents/chat/ChatQuoteList';
 import { useToast } from '@fastgpt/web/hooks/useToast';
 import { ChatTypeEnum } from '@/components/core/chat/ChatContainer/ChatBox/constants';
+import ShareResourceUpload from '@/components/core/chat/ChatContainer/ChatBox/components/ShareResourceUpload';
 
 const CustomPluginRunBox = dynamic(() => import('@/pageComponents/chat/CustomPluginRunBox'));
 
@@ -304,6 +305,24 @@ const OutLink = (props: Props) => {
                     showHistory={showHistory === '1'}
                   />
                 ) : null}
+                {/* 资源推荐上传按钮 */}
+                {outLinkAuthData.shareId && outLinkAuthData.outLinkUid && (
+                  <Flex
+                    px={4}
+                    py={1}
+                    borderBottom="1px solid"
+                    borderColor="myGray.100"
+                    bg="white"
+                    alignItems="center"
+                    justifyContent="flex-end"
+                  >
+                    <ShareResourceUpload
+                      appId={appId}
+                      shareId={outLinkAuthData.shareId}
+                      outLinkUid={outLinkAuthData.outLinkUid}
+                    />
+                  </Flex>
+                )}
                 {/* chat box */}
                 <Box flex={1} bg={'white'}>
                   {isPlugin ? (
